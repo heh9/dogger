@@ -19,9 +19,11 @@ require (
 	github.com/Azure/go-autorest/logger v0.2.1 // indirect
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
 	github.com/RoaringBitmap/roaring v1.2.1 // indirect
+	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/armon/go-metrics v0.0.0-20180917152333-f0300d1749da // indirect
 	github.com/aws/aws-sdk-go v1.55.6 // indirect
 	github.com/bits-and-blooms/bitset v1.2.0 // indirect
+	github.com/buildkite/terminal-to-html/v3 v3.16.4 // indirect
 	github.com/buraksezer/consistent v0.10.0 // indirect
 	github.com/buraksezer/olric v0.5.7 // indirect
 	github.com/buraksezer/olric-cloud-plugin v0.3.0-beta.4 // indirect

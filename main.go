@@ -8,13 +8,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/acarl005/stripansi"
 	"github.com/buraksezer/olric"
 	"github.com/buraksezer/olric/config"
 	"github.com/bwmarrin/discordgo"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/lmittmann/tint"
 	slogmulti "github.com/samber/slog-multi"
@@ -151,7 +155,37 @@ func main() {
 	}
 
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		content := fmt.Sprintf("You called function %s", i.ApplicationCommandData().Options[0].StringValue())
+		key := uuid.New().String()
+
+		f := i.ApplicationCommandData().Options[0].StringValue()
+		content := fmt.Sprintf("You called %s, visit the logs at: http://127.0.0.1:8080/logs/%s", f, key)
+
+		// Checkout the code from the source
+
+		// Exec dagger function on the Kubernetes engine
+		cmd := exec.Command("dagger", "call", f, "--progress=plain", "--source=.")
+
+		go func() {
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				slog.Error("Failed to execute dagger function", slog.Any("error", err))
+			}
+
+			if err := store.Put(ctx, key, stripansi.Strip(string(out))); err != nil {
+				slog.Error("Failed to put value", slog.Any("error", err))
+				return
+			}
+
+			t, err := time.ParseDuration(*expiration)
+			if err != nil {
+				slog.Error("Failed to parse expiration", slog.Any("error", err))
+				t = 5 * time.Minute
+			}
+
+			if err := store.Expire(ctx, key, t); err != nil {
+				slog.Error("Failed to expire key", slog.Any("error", err))
+			}
+		}()
 
 		dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -164,6 +198,35 @@ func main() {
 	})
 
 	router := mux.NewRouter()
+
+	router.Handle(
+		"/logs/{key}",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			key := mux.Vars(r)["key"]
+			if key == "" {
+				http.Error(w, "Key is required", http.StatusBadRequest)
+				return
+			}
+
+			v, err := store.Get(ctx, key)
+			if err != nil {
+				http.Error(w, "Failed to get value", http.StatusInternalServerError)
+				return
+			}
+
+			text, err := v.String()
+			if err != nil {
+				http.Error(w, "Failed to convert value to string", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(text))
+		}),
+	)
 
 	srv := &http.Server{
 		Addr:    ":8080",
