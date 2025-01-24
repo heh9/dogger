@@ -1,10 +1,10 @@
-name: Gitea Actions Demo
+name: gitea-actions-demo
 run-name: ${{ gitea.actor }} is testing out Gitea Actions 🚀
 on: [push]
 
 jobs:
-  Explore-Gitea-Actions:
-    runs-on: ubuntu-latest
+  explore-gitea-actions:
+    runs-on: ubuntu-22.04
     steps:
       - run: echo "🎉 The job was automatically triggered by a ${{ gitea.event_name }} event."
       - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by Gitea!"
