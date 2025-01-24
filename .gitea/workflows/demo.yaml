@@ -10,7 +10,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v2
     - name: Run Dagger Build
-      uses: heh9/dagger-for-gitea@master
+      uses: heh9/dagger-for-gitea@main
       with:
         args: "-source=."
         engine-stop: false
