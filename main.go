@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/acarl005/stripansi"
+	"github.com/buildkite/terminal-to-html/v3"
 	"github.com/buraksezer/olric"
 	"github.com/buraksezer/olric/config"
 	"github.com/bwmarrin/discordgo"
@@ -87,6 +87,12 @@ func main() {
 		}),
 	))
 	slog.SetDefault(logger)
+
+	sb, err := os.ReadFile("terminal.css")
+	if err != nil {
+		slog.Error("Failed to read terminal.css", slog.Any("error", err))
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 
@@ -171,7 +177,7 @@ func main() {
 				slog.Error("Failed to execute dagger function", slog.Any("error", err))
 			}
 
-			if err := store.Put(ctx, key, stripansi.Strip(string(out))); err != nil {
+			if err := store.Put(ctx, key, string(out)); err != nil {
 				slog.Error("Failed to put value", slog.Any("error", err))
 				return
 			}
@@ -179,7 +185,7 @@ func main() {
 			t, err := time.ParseDuration(*expiration)
 			if err != nil {
 				slog.Error("Failed to parse expiration", slog.Any("error", err))
-				t = 5 * time.Minute
+				t = time.Duration(5 * time.Minute)
 			}
 
 			if err := store.Expire(ctx, key, t); err != nil {
@@ -217,14 +223,29 @@ func main() {
 				return
 			}
 
-			text, err := v.String()
+			out, err := v.String()
 			if err != nil {
 				http.Error(w, "Failed to convert value to string", http.StatusInternalServerError)
 				return
 			}
 
-			w.Header().Set("Content-Type", "text/plain")
-			w.Write([]byte(text))
+			html := terminal.Render([]byte(out))
+
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprintf(
+				w,
+				`<!DOCTYPE html>
+				<html>
+				<head>
+					<style>%s</style>
+				</head>
+				<body>
+					<div class="term-container">%s</div>
+				</body>
+				</html>`,
+				sb,
+				html,
+			)
 		}),
 	)
 
