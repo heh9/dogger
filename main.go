@@ -4,13 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -32,22 +30,24 @@ var (
 	guild      = flag.String("guild", "", "Discord guild")
 )
 
-type slogWriter struct {
+type SlogWriter struct {
 	logger *slog.Logger
+	level  slog.Level
 }
 
-func (w *slogWriter) Write(p []byte) (n int, err error) {
-	msg := strings.TrimSuffix(string(p), "\n")
-
-	switch {
-	case strings.Contains(strings.ToLower(msg), "ERR"):
-		w.logger.Error(msg)
-	case strings.Contains(strings.ToLower(msg), "WARN"):
-		w.logger.Warn(msg)
-	default:
-		w.logger.Info(msg)
+func NewSlogWriter(logger *slog.Logger, level slog.Level) *SlogWriter {
+	return &SlogWriter{
+		logger: logger,
+		level:  level,
 	}
+}
 
+func (w *SlogWriter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
+		msg = msg[:len(msg)-1]
+	}
+	w.logger.Log(context.Background(), w.level, msg)
 	return len(p), nil
 }
 
@@ -88,16 +88,10 @@ func main() {
 	))
 	slog.SetDefault(logger)
 
-	sb, err := os.ReadFile("terminal.css")
-	if err != nil {
-		slog.Error("Failed to read terminal.css", slog.Any("error", err))
-		os.Exit(1)
-	}
-
 	ctx := context.Background()
 
 	conf := config.New("local")
-	conf.Logger = log.New(&slogWriter{logger: logger}, "", 0)
+	conf.LogOutput = NewSlogWriter(logger, logl)
 	octx, cancel := context.WithCancel(ctx)
 	conf.Started = func() {
 		defer cancel()
@@ -205,6 +199,12 @@ func main() {
 
 	router := mux.NewRouter()
 
+	sb, err := os.ReadFile("stylesheet.css")
+	if err != nil {
+		slog.Error("Failed to read terminal.css", slog.Any("error", err))
+		os.Exit(1)
+	}
+
 	router.Handle(
 		"/logs/{key}",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +239,7 @@ func main() {
 				<head>
 					<style>%s</style>
 				</head>
-				<body>
+				<body style="background-color: #171717;">
 					<div class="term-container">%s</div>
 				</body>
 				</html>`,
