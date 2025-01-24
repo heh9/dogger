@@ -30,25 +30,45 @@ var (
 	guild      = flag.String("guild", "", "Discord guild")
 )
 
-type SlogWriter struct {
+type slogWriter struct {
 	logger *slog.Logger
 	level  slog.Level
 }
 
-func NewSlogWriter(logger *slog.Logger, level slog.Level) *SlogWriter {
-	return &SlogWriter{
+func NewSlogWriter(logger *slog.Logger, level slog.Level) *slogWriter {
+	return &slogWriter{
 		logger: logger,
 		level:  level,
 	}
 }
 
-func (w *SlogWriter) Write(p []byte) (n int, err error) {
+func (w *slogWriter) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
 		msg = msg[:len(msg)-1]
 	}
 	w.logger.Log(context.Background(), w.level, msg)
 	return len(p), nil
+}
+
+func isCoordinatorNode(ctx context.Context, e *olric.EmbeddedClient) bool {
+	if err := e.RefreshMetadata(ctx); err != nil {
+		slog.Error("Failed to refresh metadata", slog.Any("error", err))
+		return false
+	}
+
+	members, err := e.Members(ctx)
+	if err != nil {
+		slog.Error("Failed to get members", slog.Any("error", err))
+		return false
+	}
+	for _, m := range members {
+		if m.Coordinator {
+			return true
+		}
+	}
+
+	return false
 }
 
 func main() {
@@ -155,17 +175,20 @@ func main() {
 	}
 
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		key := uuid.New().String()
+		// Don't process the interaction if the node is not the leader
+		if !isCoordinatorNode(ctx, e) {
+			return
+		}
 
+		key := uuid.New().String()
 		f := i.ApplicationCommandData().Options[0].StringValue()
 		content := fmt.Sprintf("You called %s, visit the logs at: http://127.0.0.1:8080/logs/%s", f, key)
 
 		// Checkout the code from the source
 
-		// Exec dagger function on the Kubernetes engine
-		cmd := exec.Command("dagger", "call", f, "--progress=plain", "--source=.")
-
 		go func() {
+			cmd := exec.Command("dagger", "call", f, "--progress=plain", "--source=.")
+
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				slog.Error("Failed to execute dagger function", slog.Any("error", err))
