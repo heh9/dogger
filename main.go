@@ -27,6 +27,13 @@ import (
 	slogmulti "github.com/samber/slog-multi"
 )
 
+const (
+	AbortEmbed   = "https://media.giphy.com/media/G7iGNzr3VBING/giphy.gif?cid=790b7611zrca4oc8r9timt6d1fynumfr9k5wryshsup45uun&ep=v1_gifs_search&rid=giphy.gif&ct=g"
+	SuccessEmbed = "https://media.giphy.com/media/sVnKj2wDhUTsFKFWhx/giphy.gif?cid=ecf05e472cewcrbacimrrrwkmjqzjfo6hiff91p1jl5x7gmv&ep=v1_gifs_search&rid=giphy.gif&ct=g"
+	StartedEmbed = "https://media.giphy.com/media/A5ugHVbuFL3uo/giphy.gif?cid=790b7611h5fxvu46dd1n68atnngfes7rln3ctxbk0iaq05bf&ep=v1_gifs_search&rid=giphy.gif&ct=g"
+	FailedEmbed  = "https://media.giphy.com/media/vVZypcXdxD508UOjfY/giphy.gif?cid=790b7611xvurpnd9l9fwhklhp25yzcvyen9vwwa231p13987&ep=v1_gifs_search&rid=giphy.gif&ct=g"
+)
+
 var (
 	token      = flag.String("token", "", "Bot Token")
 	expiration = flag.String("expiration", "", "Expiration time in seconds")
@@ -95,6 +102,7 @@ func isCoordinatorNode(ctx context.Context, e *olric.EmbeddedClient) bool {
 type job struct {
 	command  *exec.Cmd
 	interact *discordgo.InteractionCreate
+	canceled bool
 }
 
 func main() {
@@ -222,14 +230,13 @@ func main() {
 	jobs := make(map[string]*job)
 
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		var hasError bool
-
-		if i.Type != discordgo.InteractionApplicationCommand {
-			return
-		}
+		var (
+			hasError bool
+			content  string
+		)
 
 		// Don't process the interaction if the node is not the leader
-		if !isCoordinatorNode(ctx, e) {
+		if !isCoordinatorNode(ctx, e) || i.Type != discordgo.InteractionApplicationCommand {
 			return
 		}
 		key := uuid.New().String()
@@ -239,11 +246,8 @@ func main() {
 			args[o.Name] = o.StringValue()
 		}
 
-		logUri := fmt.Sprintf("%s/logs/%s", *fqdn, key)
-		content := fmt.Sprintf(
-			"You called %s, visit the logs at: %s", args["function"], logUri,
-		)
 		logOutput := ""
+		logUri := fmt.Sprintf("%s/logs/%s", *fqdn, key)
 		wg := sync.WaitGroup{}
 		saveLog := func() {
 			if err := store.Put(ctx, key, logOutput); err != nil {
@@ -269,15 +273,53 @@ func main() {
 
 			if err := os.RemoveAll(workDir); err != nil {
 				slog.Error("Failed to remove temporary directory", slog.Any("error", err))
-				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v\n", err)
+				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v", err)
 			}
 
-			content := "✅ Job finished"
+			label := "Success"
+			gif := SuccessEmbed
+			buttonStyle := discordgo.SuccessButton
+			content = "**Beautiful. Stunning. Perfection.**"
 			if hasError {
-				content = "❌ Something went wrong, check the logs for reason"
+				label = "Error"
+				gif = FailedEmbed
+				content = "**Oh, come on! This is raw! Absolutely embarrassing.**"
+				buttonStyle = discordgo.DangerButton
 			}
-			_, err = dgo.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Content: content,
+			if j, ok := jobs[key]; ok && j.canceled {
+				label = "Canceled"
+				gif = AbortEmbed
+				content = "**What is this? A half-baked disaster? Canceled. Get it together!**"
+				buttonStyle = discordgo.DangerButton
+			}
+
+			_, err = dgo.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Components: &[]discordgo.MessageComponent{
+					discordgo.ActionsRow{
+						Components: []discordgo.MessageComponent{
+							discordgo.Button{
+								Label: "Logs",
+								Style: discordgo.LinkButton,
+								URL:   logUri,
+							},
+							discordgo.Button{
+								Label:    label,
+								Style:    buttonStyle,
+								CustomID: key,
+								Disabled: true,
+							},
+						},
+					},
+				},
+				Content: &content,
+				Embeds: &[]*discordgo.MessageEmbed{
+					{
+						Image: &discordgo.MessageEmbedImage{
+							URL: gif,
+						},
+						Type: discordgo.EmbedTypeLink,
+					},
+				},
 			})
 			if err != nil {
 				slog.Error("Failed to send followup message", slog.Any("error", err))
@@ -314,11 +356,8 @@ func main() {
 			cmd := exec.Command(
 				"dagger", "call", args["function"], "--progress=plain", fmt.Sprintf("--source=%s", args["source"]),
 			)
-			jobs[key] = &job{
-				interact: i,
-				command:  cmd,
-			}
 			cmd.Dir = workDir
+			jobs[key] = &job{command: cmd, interact: i}
 
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -348,7 +387,15 @@ func main() {
 						},
 					},
 				},
-				Content: fmt.Sprintf("🚀 Started job `%s`", key),
+				Content: "**Move it, move it! This job won't cook itself!**",
+				Embeds: []*discordgo.MessageEmbed{
+					{
+						Image: &discordgo.MessageEmbedImage{
+							URL: StartedEmbed,
+						},
+						Type: discordgo.EmbedTypeLink,
+					},
+				},
 			},
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 		})
@@ -361,32 +408,33 @@ func main() {
 	})
 
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		if !isCoordinatorNode(ctx, e) {
-			return
-		}
-
 		var (
 			key     string
 			content string
 		)
 
-		if i.Type == discordgo.InteractionMessageComponent {
-			key = i.MessageComponentData().CustomID
+		if !isCoordinatorNode(ctx, e) || i.Type != discordgo.InteractionMessageComponent {
+			return
 		}
+
 		finish := func() {
-			dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseUpdateMessage,
+			err := dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Data: &discordgo.InteractionResponseData{
 					Content: content,
 				},
+				Type: discordgo.InteractionResponseUpdateMessage,
 			})
+			if err != nil {
+				slog.Error("Failed to send followup message", slog.Any("error", err))
+			}
 		}
 		defer finish()
 
+		key = i.MessageComponentData().CustomID
+
 		j, ok := jobs[key]
-		prettyj := fmt.Sprintf("`%s`", key)
 		if !ok {
-			content = "❌ Job already finished or not found" + prettyj
+			content = fmt.Sprintf("Job `%s` not found\n\n", key)
 			return
 		}
 
@@ -395,13 +443,14 @@ func main() {
 			err := syscall.Kill(j.command.Process.Pid, syscall.SIGKILL)
 			if err != nil {
 				slog.Error("Failed to kill job process", slog.Any("error", err))
-				content = "❌ Failed to cancel job" + prettyj
-
+				content = fmt.Sprintf("Failed to kill job process: %v\n\n", err)
 				return
 			}
+
+			j.canceled = true
 		}
 
-		content = "✅ Job cancelled" + prettyj
+		content = fmt.Sprintf("Canceled job `%s`", key)
 	})
 
 	router := mux.NewRouter()
