@@ -92,6 +92,11 @@ func isCoordinatorNode(ctx context.Context, e *olric.EmbeddedClient) bool {
 	return false
 }
 
+type job struct {
+	command  *exec.Cmd
+	interact *discordgo.InteractionCreate
+}
+
 func main() {
 	w := os.Stderr
 
@@ -214,7 +219,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	jobs := make(map[string]*job)
+
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		var hasError bool
+
+		if i.Type != discordgo.InteractionApplicationCommand {
+			return
+		}
+
 		// Don't process the interaction if the node is not the leader
 		if !isCoordinatorNode(ctx, e) {
 			return
@@ -226,8 +239,9 @@ func main() {
 			args[o.Name] = o.StringValue()
 		}
 
+		logUri := fmt.Sprintf("%s/logs/%s", *fqdn, key)
 		content := fmt.Sprintf(
-			"You called %s, visit the logs at: %s/logs/%s", args["function"], *fqdn, key,
+			"You called %s, visit the logs at: %s", args["function"], logUri,
 		)
 		logOutput := ""
 		wg := sync.WaitGroup{}
@@ -244,6 +258,7 @@ func main() {
 
 		workDir, err := os.MkdirTemp("", "dagger-job-")
 		if err != nil {
+			hasError = true
 			slog.Error("Failed to create temporary directory", slog.Any("error", err))
 			logOutput += fmt.Sprintf("Failed to create temporary directory: %v\n", err)
 			return
@@ -256,24 +271,37 @@ func main() {
 				slog.Error("Failed to remove temporary directory", slog.Any("error", err))
 				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v\n", err)
 			}
+
+			content := "✅ Job finished"
+			if hasError {
+				content = "❌ Something went wrong, check the logs for reason"
+			}
+			_, err = dgo.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+				Content: content,
+			})
+			if err != nil {
+				slog.Error("Failed to send followup message", slog.Any("error", err))
+			}
+
 			saveLog()
+			delete(jobs, key)
 		}
 		defer finish()
 
 		var prog bytes.Buffer
-		br := "master"
-		if args["from"] != "" {
-			br = args["from"]
+		if args["from"] == "" {
+			args["from"] = "master"
 		}
 		gitOpts := &git.CloneOptions{
 			URL:           *repo,
-			ReferenceName: plumbing.NewBranchReferenceName(br),
+			ReferenceName: plumbing.NewBranchReferenceName(args["from"]),
 			Progress:      &prog,
 		}
 
 		_, err = git.PlainClone(workDir, false, gitOpts)
 		logOutput += prog.String()
 		if err != nil {
+			hasError = true
 			slog.Error("Failed to clone repository", slog.Any("error", err))
 			logOutput += fmt.Sprintf("Failed to clone repository: %v\n", err)
 			return
@@ -286,9 +314,15 @@ func main() {
 			cmd := exec.Command(
 				"dagger", "call", args["function"], "--progress=plain", fmt.Sprintf("--source=%s", args["source"]),
 			)
+			jobs[key] = &job{
+				interact: i,
+				command:  cmd,
+			}
 			cmd.Dir = workDir
+
 			out, err := cmd.CombinedOutput()
 			if err != nil {
+				hasError = true
 				slog.Error("Failed to execute dagger function", slog.Any("error", err))
 				logOutput += fmt.Sprintf("Failed to execute dagger function: %v\n", err)
 			}
@@ -296,14 +330,78 @@ func main() {
 			logOutput += string(out)
 		}()
 
-		dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
+		err = dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Data: &discordgo.InteractionResponseData{
-				Content: content,
+				Components: []discordgo.MessageComponent{
+					discordgo.ActionsRow{
+						Components: []discordgo.MessageComponent{
+							discordgo.Button{
+								Label: "Logs",
+								Style: discordgo.LinkButton,
+								URL:   logUri,
+							},
+							discordgo.Button{
+								Label:    "Cancel job",
+								Style:    discordgo.DangerButton,
+								CustomID: key,
+							},
+						},
+					},
+				},
+				Content: fmt.Sprintf("🚀 Started job `%s`", key),
 			},
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
 		})
+		if err != nil {
+			slog.Error("Failed to respond to interaction", slog.Any("error", err))
+			return
+		}
 
 		slog.Info("Interaction received", slog.Any("content", content))
+	})
+
+	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if !isCoordinatorNode(ctx, e) {
+			return
+		}
+
+		var (
+			key     string
+			content string
+		)
+
+		if i.Type == discordgo.InteractionMessageComponent {
+			key = i.MessageComponentData().CustomID
+		}
+		finish := func() {
+			dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseUpdateMessage,
+				Data: &discordgo.InteractionResponseData{
+					Content: content,
+				},
+			})
+		}
+		defer finish()
+
+		j, ok := jobs[key]
+		prettyj := fmt.Sprintf("`%s`", key)
+		if !ok {
+			content = "❌ Job already finished or not found" + prettyj
+			return
+		}
+
+		if j.command != nil && j.command.Process != nil {
+			// Use negative PID to kill the entire process group
+			err := syscall.Kill(j.command.Process.Pid, syscall.SIGKILL)
+			if err != nil {
+				slog.Error("Failed to kill job process", slog.Any("error", err))
+				content = "❌ Failed to cancel job" + prettyj
+
+				return
+			}
+		}
+
+		content = "✅ Job cancelled" + prettyj
 	})
 
 	router := mux.NewRouter()
