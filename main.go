@@ -27,13 +27,6 @@ import (
 	slogmulti "github.com/samber/slog-multi"
 )
 
-const (
-	AbortEmbed   = "https://media.giphy.com/media/G7iGNzr3VBING/giphy.gif?cid=790b7611zrca4oc8r9timt6d1fynumfr9k5wryshsup45uun&ep=v1_gifs_search&rid=giphy.gif&ct=g"
-	SuccessEmbed = "https://media.giphy.com/media/sVnKj2wDhUTsFKFWhx/giphy.gif?cid=ecf05e472cewcrbacimrrrwkmjqzjfo6hiff91p1jl5x7gmv&ep=v1_gifs_search&rid=giphy.gif&ct=g"
-	StartedEmbed = "https://media.giphy.com/media/A5ugHVbuFL3uo/giphy.gif?cid=790b7611h5fxvu46dd1n68atnngfes7rln3ctxbk0iaq05bf&ep=v1_gifs_search&rid=giphy.gif&ct=g"
-	FailedEmbed  = "https://media.giphy.com/media/vVZypcXdxD508UOjfY/giphy.gif?cid=790b7611xvurpnd9l9fwhklhp25yzcvyen9vwwa231p13987&ep=v1_gifs_search&rid=giphy.gif&ct=g"
-)
-
 var (
 	token      = flag.String("token", "", "Bot Token")
 	expiration = flag.String("expiration", "", "Expiration time in seconds")
@@ -100,9 +93,10 @@ func isCoordinatorNode(ctx context.Context, e *olric.EmbeddedClient) bool {
 }
 
 type job struct {
-	command  *exec.Cmd
-	interact *discordgo.InteractionCreate
+	mu sync.Mutex
+
 	canceled bool
+	command  *exec.Cmd
 }
 
 func main() {
@@ -245,6 +239,7 @@ func main() {
 		for _, o := range i.ApplicationCommandData().Options {
 			args[o.Name] = o.StringValue()
 		}
+		args["job id"] = key
 
 		logOutput := ""
 		logUri := fmt.Sprintf("%s/logs/%s", *fqdn, key)
@@ -268,6 +263,9 @@ func main() {
 			return
 		}
 
+		embeds := NewEmbedBuilder().AddFields(args)
+		messageComponents := NewMessageComponentsBuilder().AddLogsButton(logUri)
+
 		finish := func() {
 			wg.Wait()
 
@@ -276,50 +274,25 @@ func main() {
 				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v", err)
 			}
 
-			label := "Success"
-			gif := SuccessEmbed
-			buttonStyle := discordgo.SuccessButton
+			var status int
+
 			content = "**Beautiful. Stunning. Perfection.**"
 			if hasError {
-				label = "Error"
-				gif = FailedEmbed
+				status = JobFailed
 				content = "**Oh, come on! This is raw! Absolutely embarrassing.**"
-				buttonStyle = discordgo.DangerButton
 			}
 			if j, ok := jobs[key]; ok && j.canceled {
-				label = "Canceled"
-				gif = AbortEmbed
+				status = JobCanceled
 				content = "**What is this? A half-baked disaster? Canceled. Get it together!**"
-				buttonStyle = discordgo.DangerButton
 			}
+			embeds = embeds.ApplyStatus(status)
+			messageComponents = NewMessageComponentsBuilder().AddLogsButton(logUri).AddStatusButton(status)
+			components := messageComponents.Build()
 
 			_, err = dgo.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Components: &[]discordgo.MessageComponent{
-					discordgo.ActionsRow{
-						Components: []discordgo.MessageComponent{
-							discordgo.Button{
-								Label: "Logs",
-								Style: discordgo.LinkButton,
-								URL:   logUri,
-							},
-							discordgo.Button{
-								Label:    label,
-								Style:    buttonStyle,
-								CustomID: key,
-								Disabled: true,
-							},
-						},
-					},
-				},
-				Content: &content,
-				Embeds: &[]*discordgo.MessageEmbed{
-					{
-						Image: &discordgo.MessageEmbedImage{
-							URL: gif,
-						},
-						Type: discordgo.EmbedTypeLink,
-					},
-				},
+				Content:    &content,
+				Components: &components,
+				Embeds:     &[]*discordgo.MessageEmbed{embeds.Build()},
 			})
 			if err != nil {
 				slog.Error("Failed to send followup message", slog.Any("error", err))
@@ -330,10 +303,12 @@ func main() {
 		}
 		defer finish()
 
-		var prog bytes.Buffer
 		if args["from"] == "" {
 			args["from"] = "master"
 		}
+		embeds = embeds.AddFields(args)
+
+		var prog bytes.Buffer
 		gitOpts := &git.CloneOptions{
 			URL:           *repo,
 			ReferenceName: plumbing.NewBranchReferenceName(args["from"]),
@@ -357,7 +332,7 @@ func main() {
 				"dagger", "call", args["function"], "--progress=plain", fmt.Sprintf("--source=%s", args["source"]),
 			)
 			cmd.Dir = workDir
-			jobs[key] = &job{command: cmd, interact: i}
+			jobs[key] = &job{command: cmd}
 
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -369,33 +344,14 @@ func main() {
 			logOutput += string(out)
 		}()
 
+		embeds = embeds.ApplyStatus(JobRunning)
+		messageComponents = messageComponents.AddActionButton("Cancel job", key, true)
+
 		err = dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Data: &discordgo.InteractionResponseData{
-				Components: []discordgo.MessageComponent{
-					discordgo.ActionsRow{
-						Components: []discordgo.MessageComponent{
-							discordgo.Button{
-								Label: "Logs",
-								Style: discordgo.LinkButton,
-								URL:   logUri,
-							},
-							discordgo.Button{
-								Label:    "Cancel job",
-								Style:    discordgo.DangerButton,
-								CustomID: key,
-							},
-						},
-					},
-				},
-				Content: "**Move it, move it! This job won't cook itself!**",
-				Embeds: []*discordgo.MessageEmbed{
-					{
-						Image: &discordgo.MessageEmbedImage{
-							URL: StartedEmbed,
-						},
-						Type: discordgo.EmbedTypeLink,
-					},
-				},
+				Components: messageComponents.Build(),
+				Embeds:     []*discordgo.MessageEmbed{embeds.Build()},
+				Content:    "**Move it, move it! This job won't cook itself!**",
 			},
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 		})
@@ -437,6 +393,9 @@ func main() {
 			content = fmt.Sprintf("Job `%s` not found\n\n", key)
 			return
 		}
+
+		j.mu.Lock()
+		defer j.mu.Unlock()
 
 		if j.command != nil && j.command.Process != nil {
 			// Use negative PID to kill the entire process group
