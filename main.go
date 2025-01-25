@@ -229,6 +229,8 @@ func main() {
 			content  string
 		)
 
+		start := time.Now()
+
 		// Don't process the interaction if the node is not the leader
 		if !isCoordinatorNode(ctx, e) || i.Type != discordgo.InteractionApplicationCommand {
 			return
@@ -273,6 +275,7 @@ func main() {
 				slog.Error("Failed to remove temporary directory", slog.Any("error", err))
 				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v", err)
 			}
+			args["duration"] = time.Since(start).String()
 
 			var status int
 
@@ -285,7 +288,10 @@ func main() {
 				status = JobCanceled
 				content = "**What is this? A half-baked disaster? Canceled. Get it together!**"
 			}
+
+			embeds = embeds.AddFields(args)
 			embeds = embeds.ApplyStatus(status)
+
 			messageComponents = NewMessageComponentsBuilder().AddLogsButton(logUri).AddStatusButton(status)
 			components := messageComponents.Build()
 

@@ -1,3 +1,4 @@
 aiohttp==3.9.3
 wavefile==1.6.2
 pydub==0.25.1
+fastapi==0.111.0
