@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,11 +44,25 @@ func NewSlogWriter(logger *slog.Logger, level slog.Level) *slogWriter {
 }
 
 func (w *slogWriter) Write(p []byte) (n int, err error) {
+	var level slog.Level
+
 	msg := string(p)
+	start := strings.Index(msg, "[")
+	end := strings.Index(msg, "]")
+
+	if start != -1 && end != -1 {
+		if err := level.UnmarshalText([]byte(msg[start+1 : end])); err != nil {
+			level = slog.LevelError
+		}
+
+		msg = msg[end+1:]
+	}
+
 	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
 		msg = msg[:len(msg)-1]
 	}
-	w.logger.Log(context.Background(), w.level, msg)
+	w.logger.Log(context.Background(), level, msg)
+
 	return len(p), nil
 }
 
