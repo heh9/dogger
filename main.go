@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +19,8 @@ import (
 	"github.com/buraksezer/olric"
 	"github.com/buraksezer/olric/config"
 	"github.com/bwmarrin/discordgo"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/lmittmann/tint"
@@ -29,6 +33,8 @@ var (
 	level      = flag.String("level", "info", "Log level")
 	selector   = flag.String("selector", "", "Kubernetes selector")
 	guild      = flag.String("guild", "", "Discord guild")
+	fqdn       = flag.String("fqdn", "http://127.0.0.1:8080", "FQDN")
+	repo       = flag.String("repo", "git@github.com:heh9/dogger.git", "Repository")
 )
 
 type slogWriter struct {
@@ -123,6 +129,12 @@ func main() {
 	))
 	slog.SetDefault(logger)
 
+	logExpiration, err := time.ParseDuration(*expiration)
+	if err != nil {
+		slog.Error("Failed to parse expiration", slog.Any("error", err))
+		logExpiration = time.Duration(60 * time.Minute)
+	}
+
 	ctx := context.Background()
 
 	conf := config.New("local")
@@ -181,6 +193,19 @@ func main() {
 				Description: "The function to call",
 				Required:    true,
 			},
+			{
+				Name:        "source",
+				Type:        discordgo.ApplicationCommandOptionString,
+				Description: "The source directory to use",
+				Required:    true,
+			},
+			{
+				Name: "from",
+				// Optional, uses master by default
+				Type:        discordgo.ApplicationCommandOptionString,
+				Description: "The commit hash or branch name to call on",
+				Required:    false,
+			},
 		},
 		Type: discordgo.ChatApplicationCommand,
 	})
@@ -194,35 +219,81 @@ func main() {
 		if !isCoordinatorNode(ctx, e) {
 			return
 		}
-
 		key := uuid.New().String()
-		f := i.ApplicationCommandData().Options[0].StringValue()
-		content := fmt.Sprintf("You called %s, visit the logs at: http://127.0.0.1:8080/logs/%s", f, key)
 
-		// Checkout the code from the source
+		args := make(map[string]string)
+		for _, o := range i.ApplicationCommandData().Options {
+			args[o.Name] = o.StringValue()
+		}
 
-		go func() {
-			cmd := exec.Command("dagger", "call", f, "--progress=plain", "--source=.")
-
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				slog.Error("Failed to execute dagger function", slog.Any("error", err))
-			}
-
-			if err := store.Put(ctx, key, string(out)); err != nil {
+		content := fmt.Sprintf(
+			"You called %s, visit the logs at: %s/logs/%s", args["function"], *fqdn, key,
+		)
+		logOutput := ""
+		wg := sync.WaitGroup{}
+		saveLog := func() {
+			if err := store.Put(ctx, key, logOutput); err != nil {
 				slog.Error("Failed to put value", slog.Any("error", err))
 				return
 			}
 
-			t, err := time.ParseDuration(*expiration)
-			if err != nil {
-				slog.Error("Failed to parse expiration", slog.Any("error", err))
-				t = time.Duration(5 * time.Minute)
-			}
-
-			if err := store.Expire(ctx, key, t); err != nil {
+			if err := store.Expire(ctx, key, logExpiration); err != nil {
 				slog.Error("Failed to expire key", slog.Any("error", err))
 			}
+		}
+
+		workDir, err := os.MkdirTemp("", "dagger-job-")
+		if err != nil {
+			slog.Error("Failed to create temporary directory", slog.Any("error", err))
+			logOutput += fmt.Sprintf("Failed to create temporary directory: %v\n", err)
+			return
+		}
+
+		finish := func() {
+			wg.Wait()
+
+			if err := os.RemoveAll(workDir); err != nil {
+				slog.Error("Failed to remove temporary directory", slog.Any("error", err))
+				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v\n", err)
+			}
+			saveLog()
+		}
+		defer finish()
+
+		var prog bytes.Buffer
+		br := "master"
+		if args["from"] != "" {
+			br = args["from"]
+		}
+		gitOpts := &git.CloneOptions{
+			URL:           *repo,
+			ReferenceName: plumbing.NewBranchReferenceName(br),
+			Progress:      &prog,
+		}
+
+		_, err = git.PlainClone(workDir, false, gitOpts)
+		logOutput += prog.String()
+		if err != nil {
+			slog.Error("Failed to clone repository", slog.Any("error", err))
+			logOutput += fmt.Sprintf("Failed to clone repository: %v\n", err)
+			return
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			cmd := exec.Command(
+				"dagger", "call", args["function"], "--progress=plain", fmt.Sprintf("--source=%s", args["source"]),
+			)
+			cmd.Dir = workDir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				slog.Error("Failed to execute dagger function", slog.Any("error", err))
+				logOutput += fmt.Sprintf("Failed to execute dagger function: %v\n", err)
+			}
+
+			logOutput += string(out)
 		}()
 
 		dgo.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
