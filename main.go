@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,6 +26,10 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/lmittmann/tint"
 	slogmulti "github.com/samber/slog-multi"
+)
+
+const (
+	LogRefreshInterval = 5 * time.Second
 )
 
 var (
@@ -97,6 +102,53 @@ type job struct {
 
 	canceled bool
 	command  *exec.Cmd
+}
+
+type logWriter struct {
+	mu        sync.Mutex
+	store     olric.DMap
+	key       string
+	logOutput string
+	interval  time.Duration
+	ctx       context.Context
+}
+
+func newLogWriter(ctx context.Context, store olric.DMap, key string, interval time.Duration) *logWriter {
+	lw := &logWriter{
+		store:    store,
+		key:      key,
+		interval: interval,
+		ctx:      ctx,
+	}
+	go lw.periodicUpdate()
+
+	return lw
+}
+
+func (lw *logWriter) Write(p []byte) (n int, err error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	lw.logOutput += string(p)
+
+	return len(p), nil
+}
+
+func (lw *logWriter) periodicUpdate() {
+	ticker := time.NewTicker(lw.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-lw.ctx.Done():
+			return
+		case <-ticker.C:
+			lw.mu.Lock()
+			if err := lw.store.Put(lw.ctx, lw.key, lw.logOutput); err != nil {
+				slog.Error("Failed to update log in store", slog.Any("error", err))
+			}
+			lw.mu.Unlock()
+		}
+	}
 }
 
 func main() {
@@ -222,7 +274,6 @@ func main() {
 	}
 
 	jobs := make(map[string]*job)
-
 	dgo.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		var (
 			hasError bool
@@ -230,7 +281,6 @@ func main() {
 		)
 
 		start := time.Now()
-
 		// Don't process the interaction if the node is not the leader
 		if !isCoordinatorNode(ctx, e) || i.Type != discordgo.InteractionApplicationCommand {
 			return
@@ -243,15 +293,10 @@ func main() {
 		}
 		args["job id"] = key
 
-		logOutput := ""
 		logUri := fmt.Sprintf("%s/logs/%s", *fqdn, key)
+		logWriter := newLogWriter(ctx, store, key, LogRefreshInterval)
 		wg := sync.WaitGroup{}
 		saveLog := func() {
-			if err := store.Put(ctx, key, logOutput); err != nil {
-				slog.Error("Failed to put value", slog.Any("error", err))
-				return
-			}
-
 			if err := store.Expire(ctx, key, logExpiration); err != nil {
 				slog.Error("Failed to expire key", slog.Any("error", err))
 			}
@@ -260,8 +305,8 @@ func main() {
 		workDir, err := os.MkdirTemp("", "dagger-job-")
 		if err != nil {
 			hasError = true
+			logWriter.Write([]byte(fmt.Sprintf("Failed to create temporary directory: %v\n", err)))
 			slog.Error("Failed to create temporary directory", slog.Any("error", err))
-			logOutput += fmt.Sprintf("Failed to create temporary directory: %v\n", err)
 			return
 		}
 
@@ -272,8 +317,8 @@ func main() {
 			wg.Wait()
 
 			if err := os.RemoveAll(workDir); err != nil {
+				logWriter.Write([]byte(fmt.Sprintf("Failed to remove temporary directory: %v\n", err)))
 				slog.Error("Failed to remove temporary directory", slog.Any("error", err))
-				logOutput += fmt.Sprintf("Failed to remove temporary directory: %v", err)
 			}
 			args["duration"] = time.Since(start).String()
 
@@ -322,11 +367,10 @@ func main() {
 		}
 
 		_, err = git.PlainClone(workDir, false, gitOpts)
-		logOutput += prog.String()
+		logWriter.Write([]byte(prog.String()))
 		if err != nil {
 			hasError = true
 			slog.Error("Failed to clone repository", slog.Any("error", err))
-			logOutput += fmt.Sprintf("Failed to clone repository: %v\n", err)
 			return
 		}
 
@@ -340,14 +384,40 @@ func main() {
 			cmd.Dir = workDir
 			jobs[key] = &job{command: cmd}
 
-			out, err := cmd.CombinedOutput()
+			stdout, err := cmd.StdoutPipe()
 			if err != nil {
 				hasError = true
-				slog.Error("Failed to execute dagger function", slog.Any("error", err))
-				logOutput += fmt.Sprintf("Failed to execute dagger function: %v\n", err)
+				slog.Error("Failed to get stdout pipe", slog.Any("error", err))
+				return
+			}
+			stderr, err := cmd.StderrPipe()
+			if err != nil {
+				hasError = true
+				slog.Error("Failed to get stderr pipe", slog.Any("error", err))
+				return
 			}
 
-			logOutput += string(out)
+			if err := cmd.Start(); err != nil {
+				hasError = true
+				slog.Error("Failed to start command", slog.Any("error", err))
+				return
+			}
+
+			for _, stream := range []*io.ReadCloser{&stdout, &stderr} {
+				go func(stream *io.ReadCloser) {
+					defer func() {
+						if *stream != nil {
+							(*stream).Close()
+						}
+					}()
+					io.Copy(logWriter, *stream)
+				}(stream)
+			}
+
+			if err := cmd.Wait(); err != nil {
+				hasError = true
+				slog.Error("Failed to execute dagger function", slog.Any("error", err))
+			}
 		}()
 
 		embeds = embeds.ApplyStatus(JobRunning)
@@ -375,7 +445,7 @@ func main() {
 			content string
 		)
 
-		if !isCoordinatorNode(ctx, e) || i.Type != discordgo.InteractionMessageComponent {
+		if i.Type != discordgo.InteractionMessageComponent {
 			return
 		}
 
@@ -384,10 +454,10 @@ func main() {
 				Data: &discordgo.InteractionResponseData{
 					Content: content,
 				},
-				Type: discordgo.InteractionResponseUpdateMessage,
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
 			})
 			if err != nil {
-				slog.Error("Failed to send followup message", slog.Any("error", err))
+				slog.Error("Failed to send followup message for button", slog.Any("error", err))
 			}
 		}
 		defer finish()
